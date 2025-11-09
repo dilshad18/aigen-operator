@@ -1,0 +1,26 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aigen-operator
+  # namespace: whiz-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aigen-operator
+  template:
+    metadata:
+      labels:
+        app: aigen-operator
+    spec:
+      serviceAccountName: aigen-operator
+      containers:
+      - name: operator
+        # image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        image: ahmaddilshad18/game:07
+        env:
+        - name: OPERATOR_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace

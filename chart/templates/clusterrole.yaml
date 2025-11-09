@@ -1,0 +1,36 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aigen-operator
+rules:
+  # Required to detect GPU vs CPU nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Required to scale deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+  # Required to read/write AIGen CR status
+  - apiGroups: ["infra.whiz.ai"]
+    resources: ["aigens", "aigens/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+  # Required to event AIGen CR status
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aigen-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aigen-operator
+subjects:
+  - kind: ServiceAccount
+    name: aigen-operator
+    namespace: gpu-operator

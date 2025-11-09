@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whiz-ai-gen-cpu
+  labels:
+    app: whiz-ai-gen-cpu
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: whiz-ai-gen-cpu
+  template:
+    metadata:
+      labels:
+        app: whiz-ai-gen-cpu
+    spec:
+      containers:
+        - name: whiz-ai-gen-cpu
+          image: nginx
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whiz-ai-gen-gpu
+  labels:
+    app: whiz-ai-gen-gpu
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: whiz-ai-gen-gpu
+  template:
+    metadata:
+      labels:
+        app: whiz-ai-gen-gpu
+    spec:
+      containers:
+        - name: whiz-ai-gen-gpu
+          image: nginx
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          ports:
+            - containerPort: 8080

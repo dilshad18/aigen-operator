@@ -1,0 +1,9 @@
+apiVersion: infra.whiz.ai/v1
+kind: AIGen
+metadata:
+  name: aigen
+  # namespace: whiz-operator
+spec:
+  targetNamespace: gpu-operator
+  whizCpuDeployment: whiz-ai-gen-cpu
+  whizGpuDeployment: whiz-ai-gen-gpu
