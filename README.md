@@ -36,3 +36,4 @@ spec:
   targetNamespace: whiz-ai-gen
   whizCpuDeployment: whiz-ai-gen-cpu
   whizGpuDeployment: whiz-ai-gen-gpu
+  replicas: 2
