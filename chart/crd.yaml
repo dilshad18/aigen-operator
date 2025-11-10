@@ -22,14 +22,17 @@ spec:
         - name: Namespace
           type: string
           jsonPath: .status.activeNamespace
+        - name: Replicas
+          type: integer
+          jsonPath: .status.activeReplicas
         - name: Last Sync
           type: string
           jsonPath: .status.lastSyncTime
         - name: Reason
           type: string
           jsonPath: .status.reason
-        - name: Age                       # <-- Added
-          type: date                      # <-- Required so kubectl formats it
+        - name: Age
+          type: date
           jsonPath: .metadata.creationTimestamp
       subresources:
         status: {}
@@ -46,6 +49,10 @@ spec:
                   type: string
                 whizGpuDeployment:
                   type: string
+                replicas:
+                  type: integer
+                  minimum: 1
+                  default: 1
             status:
               type: object
               properties:
@@ -57,3 +64,5 @@ spec:
                   type: string
                 reason:
                   type: string
+                activeReplicas:
+                  type: integer

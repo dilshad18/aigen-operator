@@ -19,7 +19,10 @@ spec:
       - name: operator
         # image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         image: ahmaddilshad18/game:07
+        imagePullPolicy: Always
         env:
+        - name: LOG_LEVEL
+          value: "DEBUG"
         - name: OPERATOR_NAMESPACE
           valueFrom:
             fieldRef:

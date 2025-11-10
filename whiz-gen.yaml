@@ -41,8 +41,6 @@ spec:
         - name: whiz-ai-gen-gpu
           image: nginx
           imagePullPolicy: IfNotPresent
-          resources:
-            limits:
-              nvidia.com/gpu: 1
+
           ports:
             - containerPort: 8080

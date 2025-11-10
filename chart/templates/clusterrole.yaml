@@ -33,4 +33,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: aigen-operator
-    namespace: gpu-operator
+    namespace: test

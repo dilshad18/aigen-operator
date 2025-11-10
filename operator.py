@@ -5,8 +5,19 @@ from datetime import datetime, timezone
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-logging.basicConfig(level=logging.INFO)
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Initialize default logging first
+logging.basicConfig()
+
+# Set global logging level (affects Kopf & Kubernetes client too)
+logging.getLogger().setLevel(log_level)
+
+# Set operator-specific logger
 LOG = logging.getLogger("aigen-operator")
+LOG.setLevel(log_level)
+
+LOG.info(f"Logging initialized at level: {log_level}")
 
 CRD_GROUP = "infra.whiz.ai"
 CRD_VERSION = "v1"
@@ -14,6 +25,7 @@ CRD_PLURAL = "aigens"
 OPERATOR_NAMESPACE = os.getenv("OPERATOR_NAMESPACE", "whiz-operator")
 CR_NAME = os.getenv("CR_NAME", "aigen")
 
+# Load cluster config
 try:
     config.load_incluster_config()
 except:
@@ -28,28 +40,14 @@ def is_gpu_node(node):
     labels = node.metadata.labels or {}
     alloc = node.status.allocatable or {}
 
-    # Case 1: GPU label present
     if labels.get("nvidia.com/gpu.present") == "true":
         return True
 
-    # Case 2: Actual GPU allocatable resource detected
     gpu_qty = alloc.get("nvidia.com/gpu", "0")
     try:
         return int(gpu_qty) > 0
     except ValueError:
         return False
-
-
-
-def get_node_counts():
-    gpu = cpu = 0
-    nodes = core_v1.list_node().items
-    for node in nodes:
-        if is_gpu_node(node):
-            gpu += 1
-        else:
-            cpu += 1
-    return gpu, cpu
 
 
 def get_cr_spec():
@@ -73,7 +71,7 @@ def scale_deployment(name, namespace, replicas):
         LOG.warning(f"Failed scaling {name}: {e}")
 
 
-def update_status(active_deployment, target_ns, reason):
+def update_status(active_deployment, target_ns, reason, replicas):
     now = datetime.now(timezone.utc).isoformat()
     status_body = {
         "status": {
@@ -81,6 +79,7 @@ def update_status(active_deployment, target_ns, reason):
             "activeDeployment": active_deployment,
             "activeNamespace": target_ns,
             "reason": reason,
+            "activeReplicas": replicas,
         }
     }
     try:
@@ -101,17 +100,19 @@ def reconcile():
     target_ns = spec["targetNamespace"]
     cpu_name = spec["whizCpuDeployment"]
     gpu_name = spec["whizGpuDeployment"]
+    replicas = spec.get("replicas", 1)
 
-    gpu_nodes, cpu_nodes = get_node_counts()
+    nodes = core_v1.list_node().items
+    gpu_exists = any(is_gpu_node(n) for n in nodes)
 
-    if gpu_nodes > 0:
-        scale_deployment(gpu_name, target_ns, gpu_nodes)
+    if gpu_exists:
+        scale_deployment(gpu_name, target_ns, replicas)
         scale_deployment(cpu_name, target_ns, 0)
-        update_status(gpu_name, target_ns, "GPU nodes detected")
+        update_status(gpu_name, target_ns, "GPU nodes detected", replicas)
     else:
         scale_deployment(gpu_name, target_ns, 0)
-        scale_deployment(cpu_name, target_ns, cpu_nodes)
-        update_status(cpu_name, target_ns, "No GPU nodes detected")
+        scale_deployment(cpu_name, target_ns, replicas)
+        update_status(cpu_name, target_ns, "No GPU nodes detected", replicas)
 
 
 @kopf.on.startup()
@@ -119,21 +120,17 @@ def startup(**_):
     LOG.info("AIGen Operator Started")
 
 
-# Watch for Node changes (core/v1/nodes)
 @kopf.on.event('', 'v1', 'nodes')
 def on_node_event(**_):
     reconcile()
 
-# Periodic reconcile every 60 seconds
+
 @kopf.timer('', 'v1', 'nodes', interval=60)
 def periodic(**_):
     reconcile()
 
 
-
-# Watch CR updates
 @kopf.on.create(CRD_GROUP, CRD_VERSION, CRD_PLURAL)
 @kopf.on.update(CRD_GROUP, CRD_VERSION, CRD_PLURAL)
 def on_cr_change(**_):
     reconcile()
-
