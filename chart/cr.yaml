@@ -5,6 +5,6 @@ metadata:
   name: aigen
 spec:
   targetNamespace: test
-  whizCpuDeployment: whiz-ai-gen-cpu
-  whizGpuDeployment: whiz-ai-gen-gpu
+  cpuDeployment: whiz-ai-gen-cpu
+  gpuDeployment: whiz-ai-gen-gpu
   replicas: 2

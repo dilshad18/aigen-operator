@@ -45,13 +45,12 @@ spec:
               properties:
                 targetNamespace:
                   type: string
-                whizCpuDeployment:
+                cpuDeployment:
                   type: string
-                whizGpuDeployment:
+                gpuDeployment:
                   type: string
                 replicas:
                   type: integer
-                  minimum: 1
                   default: 1
             status:
               type: object

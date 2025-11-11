@@ -5,27 +5,24 @@ from datetime import datetime, timezone
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+# ---------------- Logging Setup ----------------
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Initialize default logging first
 logging.basicConfig()
-
-# Set global logging level (affects Kopf & Kubernetes client too)
 logging.getLogger().setLevel(log_level)
 
-# Set operator-specific logger
 LOG = logging.getLogger("aigen-operator")
 LOG.setLevel(log_level)
-
 LOG.info(f"Logging initialized at level: {log_level}")
 
+# ---------------- CRD Info ----------------
 CRD_GROUP = "infra.whiz.ai"
 CRD_VERSION = "v1"
 CRD_PLURAL = "aigens"
 OPERATOR_NAMESPACE = os.getenv("OPERATOR_NAMESPACE", "whiz-operator")
 CR_NAME = os.getenv("CR_NAME", "aigen")
 
-# Load cluster config
+# ---------------- Kubernetes Client ----------------
 try:
     config.load_incluster_config()
 except:
@@ -36,6 +33,7 @@ apps_v1 = client.AppsV1Api()
 custom_api = client.CustomObjectsApi()
 
 
+# ---------------- Helper Functions ----------------
 def is_gpu_node(node):
     labels = node.metadata.labels or {}
     alloc = node.status.allocatable or {}
@@ -62,8 +60,7 @@ def get_cr_spec():
 
 
 def scale_deployment(name, namespace, replicas):
-    replicas = max(int(replicas), 0)
-    body = {"spec": {"replicas": replicas}}
+    body = {"spec": {"replicas": max(int(replicas), 0)}}
     try:
         apps_v1.patch_namespaced_deployment_scale(name, namespace, body)
         LOG.info(f"Scaled {name} → {replicas}")
@@ -73,15 +70,25 @@ def scale_deployment(name, namespace, replicas):
 
 def update_status(active_deployment, target_ns, reason, replicas):
     now = datetime.now(timezone.utc).isoformat()
-    status_body = {
-        "status": {
-            "lastSyncTime": now,
-            "activeDeployment": active_deployment,
-            "activeNamespace": target_ns,
-            "reason": reason,
-            "activeReplicas": replicas,
-        }
-    }
+
+    # Get existing status to avoid overwriting `status.kopf`
+    try:
+        cr = custom_api.get_namespaced_custom_object_status(
+            CRD_GROUP, CRD_VERSION, OPERATOR_NAMESPACE, CRD_PLURAL, CR_NAME
+        )
+        existing_status = cr.get("status", {}) or {}
+    except:
+        existing_status = {}
+
+    # Merge new fields
+    existing_status.update({
+        "lastSyncTime": now,
+        "activeDeployment": active_deployment,
+        "activeNamespace": target_ns,
+        "reason": reason,
+        "activeReplicas": replicas,
+    })
+
     try:
         custom_api.patch_namespaced_custom_object_status(
             group=CRD_GROUP,
@@ -89,17 +96,19 @@ def update_status(active_deployment, target_ns, reason, replicas):
             namespace=OPERATOR_NAMESPACE,
             plural=CRD_PLURAL,
             name=CR_NAME,
-            body=status_body,
+            body={"status": existing_status},
+            field_manager="aigen-operator",
         )
     except ApiException as e:
         LOG.warning(f"Failed to update status: {e}")
 
 
+# ---------------- Reconciliation Logic ----------------
 def reconcile():
     spec = get_cr_spec()
     target_ns = spec["targetNamespace"]
-    cpu_name = spec["whizCpuDeployment"]
-    gpu_name = spec["whizGpuDeployment"]
+    cpu_name = spec["cpuDeployment"]
+    gpu_name = spec["gpuDeployment"]
     replicas = spec.get("replicas", 1)
 
     nodes = core_v1.list_node().items
@@ -115,6 +124,7 @@ def reconcile():
         update_status(cpu_name, target_ns, "No GPU nodes detected", replicas)
 
 
+# ---------------- Event Hooks ----------------
 @kopf.on.startup()
 def startup(**_):
     LOG.info("AIGen Operator Started")
