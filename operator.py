@@ -16,6 +16,8 @@ LOG = logging.getLogger("aigen-operator")
 LOG.setLevel(log_level)
 LOG.info(f"Logging initialized at level: {log_level}")
 
+# Configurable reconcile interval (default: 60 seconds)
+RECONCILE_INTERVAL = int(os.getenv("RECONCILE_INTERVAL", "60"))
 
 # ---------------- CRD Info ----------------
 CRD_GROUP = "infra.whiz.ai"
@@ -122,12 +124,12 @@ def reconcile():
     gpu_exists = any(is_gpu_node(n) for n in nodes)
 
     if gpu_exists:
-        LOG.info("GPU node(s) detected — activating GPU deployment.")
+        LOG.info("GPU node detected — activating GPU deployment.")
         scale_deployment(gpu_name, target_ns, replicas)
         scale_deployment(cpu_name, target_ns, 0)
         update_status(gpu_name, target_ns, "GPU nodes detected", replicas)
     else:
-        LOG.info("No GPU node detected — activating CPU deployment.")
+        LOG.info("CPU node detected — activating CPU deployment.")
         scale_deployment(gpu_name, target_ns, 0)
         scale_deployment(cpu_name, target_ns, replicas)
         update_status(cpu_name, target_ns, "CPU nodes detected", replicas)
@@ -146,12 +148,11 @@ def on_node_event(**_):
     reconcile()
 
 
-@kopf.timer('', 'v1', 'nodes', interval=60)
+@kopf.timer('', 'v1', 'nodes', interval=RECONCILE_INTERVAL)
 def periodic(**_):
     """Periodic sync in case of missed events or transient errors."""
-    LOG.debug("Periodic reconciliation triggered.")
+    LOG.debug(f"Periodic reconciliation triggered (interval={RECONCILE_INTERVAL}s).")
     reconcile()
-
 
 @kopf.on.create(CRD_GROUP, CRD_VERSION, CRD_PLURAL)
 @kopf.on.update(CRD_GROUP, CRD_VERSION, CRD_PLURAL)

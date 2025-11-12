@@ -23,6 +23,8 @@ spec:
         env:
         - name: LOG_LEVEL
           value: "DEBUG"
+        - name: RECONCILE_INTERVAL
+          value: "120"
         - name: OPERATOR_NAMESPACE
           valueFrom:
             fieldRef:
