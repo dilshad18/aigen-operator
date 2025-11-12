@@ -41,4 +41,22 @@ spec:
   gpuDeployment: whiz-ai-gen-gpu
   replicas: 2
 
+```
+### Status Updates
 
+The operator updates the status field in the AIGen Custom Resource (CR) to reflect the current deployment state.
+```bash
+NAME    ACTIVE DEPLOYMENT   NAMESPACE   REPLICAS   LAST SYNC                          REASON               AGE
+aigen   whiz-ai-gen-cpu     test        1          2025-11-12T09:12:57.813768+00:00   CPU nodes detected   2d14h
+```
+#### This shows:
+
+ACTIVE DEPLOYMENT: Which deployment (cpu or gpu) is currently active
+
+NAMESPACE: Target namespace where it's running
+
+REPLICAS: Number of active replicas
+
+LAST SYNC: When the last reconciliation happened
+
+REASON: Why the switch occurred (e.g., GPU nodes detected or CPU nodes detected) 
