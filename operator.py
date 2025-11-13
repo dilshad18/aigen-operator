@@ -160,3 +160,19 @@ def on_cr_change(**_):
     """Reconcile when CR changes."""
     LOG.info("CR created or updated — triggering reconciliation.")
     reconcile()
+@kopf.on.delete('', 'v1', 'nodes')
+def on_node_delete(meta, **kwargs):
+    node_name = meta['name']
+    LOG.info(f"Node {node_name} is being deleted — removing Kopf finalizer if present.")
+
+    # Remove Kopf finalizer
+    try:
+        node = core_v1.read_node(node_name)
+        finalizers = node.metadata.finalizers or []
+        if 'kopf.zalando.org/KopfFinalizerMarker' in finalizers:
+            finalizers.remove('kopf.zalando.org/KopfFinalizerMarker')
+            core_v1.patch_node(node_name, {"metadata": {"finalizers": finalizers}})
+            LOG.info(f"Removed Kopf finalizer from {node_name}")
+    except Exception as e:
+        LOG.warning(f"Failed to remove finalizer from {node_name}: {e}")
+
