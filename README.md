@@ -16,8 +16,8 @@ It reacts dynamically to node and CR changes, and also reconciles periodically e
 
 | GPU Node Availability | Action Taken |
 |------------------------|--------------|
-| ✅ GPU nodes present | Scale **GPU Deployment** up → Scale CPU deployment down |
-| ❌ No GPU nodes | Scale **CPU Deployment** up → Scale GPU deployment down |
+| ✅ GPU nodes | Scale **GPU Deployment** up → Scale CPU deployment down |
+| ✅ CPU nodes | Scale **CPU Deployment** up → Scale GPU deployment down |
 
 ---
 
