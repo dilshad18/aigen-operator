@@ -2,8 +2,8 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: aigen-operator
-  # namespace: whiz-operator
+  name: {{ .Release.Name }}-aigen-operator
+  namespace: {{ .Release.Namespace }}
 spec:
   replicas: 1
   selector:

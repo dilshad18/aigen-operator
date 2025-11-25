@@ -36,5 +36,5 @@ roleRef:
   name: aigen-operator
 subjects:
   - kind: ServiceAccount
-    name: aigen-operator
-    namespace: test
+    name: {{ .Release.Name }}-aigen-operator
+    namespace: {{ .Release.Namespace }} 
