@@ -14,7 +14,7 @@ spec:
       labels:
         app: aigen-operator
     spec:
-      serviceAccountName: aigen-operator
+      serviceAccountName: {{ .Release.Name }}-aigen-operator
       containers:
       - name: operator
         # image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
