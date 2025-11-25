@@ -1,10 +1,10 @@
 apiVersion: infra.whiz.ai/v1
 kind: AIGen
 metadata:
-  name: {{ include "chart.name" . }}
+  name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
 spec:
-  targetNamespace: {{ .Values.targetNamespace }}
-  cpuDeployment: {{ .Values.cpuDeployment }}
-  gpuDeployment: {{ .Values.gpuDeployment }}
+  targetNamespace: {{ .Release.Namespace }}
+  cpuDeployment: {{ .Release.Name}}-whiz-ai-gen-cpu
+  gpuDeployment: {{ .Release.Name}}-whiz-ai-gen-gpu
   replicas: {{ .Values.replicas }}
