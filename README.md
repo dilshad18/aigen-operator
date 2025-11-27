@@ -14,7 +14,7 @@ The operator watches:
 
 It reacts dynamically to node and CR changes, and also reconciles periodically every 60 seconds.
 
-| GPU Node Availability | Action Taken |
+| Node Availability | Action Taken |
 |------------------------|--------------|
 | ✅ GPU nodes | Scale **GPU Deployment** up → Scale CPU deployment down |
 | ✅ CPU nodes | Scale **CPU Deployment** up → Scale GPU deployment down |
