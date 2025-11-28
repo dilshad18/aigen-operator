@@ -1,7 +1,7 @@
 apiVersion: infra.whiz.ai/v1
 kind: AIGen
 metadata:
-  name: {{ .Release.Name }}
+  name: {{ .Release.Name }}-aigen
   namespace: {{ .Release.Namespace }}
 spec:
   targetNamespace: {{ .Release.Namespace }}

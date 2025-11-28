@@ -21,10 +21,12 @@ spec:
         image: ahmaddilshad18/game:07
         imagePullPolicy: Always
         env:
+        - name: CR_NAME
+          value: {{ .Release.Name }}-aigen
         - name: LOG_LEVEL
           value: "DEBUG"
         - name: RECONCILE_INTERVAL
-          value: "120"
+          value: "180"
         - name: OPERATOR_NAMESPACE
           valueFrom:
             fieldRef:
