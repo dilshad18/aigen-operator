@@ -3,7 +3,7 @@ apiVersion: infra.whiz.ai/v1
 kind: AIGen
 metadata:
   name: aigen
-  namespace: default
+  namespace: default #namespace
 spec:
   targetNamespace: test
   cpuDeployment: whiz-ai-gen-cpu
