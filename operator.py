@@ -127,7 +127,7 @@ def remove_node_finalizers():
 
 # ---------------- Reconciliation Logic ----------------
 def reconcile():
-    """Main reconciliation logic — decide which deployment to scale."""
+    """Reconciliation logic — decide which deployment to scale."""
     spec = get_cr_spec()
     target_ns = spec["targetNamespace"]
     cpu_name = spec["cpuDeployment"]
