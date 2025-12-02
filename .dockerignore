@@ -1,0 +1,60 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.tmp
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Build / dist artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS / misc
+.DS_Store
+Thumbs.db
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Tests
+tests/
+*.pytest_cache/
+.cache/
+
+# Local configs / secrets
+*.env
+.env.*
+secrets.yaml
+config.yaml
+values.yaml
+
+# Helm charts if building container from repo root
+charts/
+crds/
+templates/
+
+# Docker
+Dockerfile.*
+docker-compose.yml
+docker-compose.*.yml
+
+# Exclude local docs
+docs/
+README.md

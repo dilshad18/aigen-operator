@@ -141,7 +141,7 @@ def startup(**_):
     LOG.info("AIGen Operator Started")
 
 
-@kopf.on.event('', 'v1', 'nodes')
+@kopf.on.event('', 'v1', 'nodes', use_finalizer=False)
 def on_node_event(**_):
     """React immediately when nodes are added/removed."""
     LOG.debug("Node event detected — triggering reconciliation.")
