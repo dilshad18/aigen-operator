@@ -54,6 +54,7 @@ templates/
 Dockerfile.*
 docker-compose.yml
 docker-compose.*.yml
+whiz-gen-exmaple.*yaml
 
 # Exclude local docs
 docs/
