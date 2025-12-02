@@ -111,6 +111,20 @@ def update_status(active_deployment, target_ns, reason, replicas):
         LOG.warning(f"Failed to update status: {e}")
 
 
+def remove_node_finalizers():
+    """Remove Kopf finalizers from all nodes."""
+    try:
+        nodes = core_v1.list_node()
+        for node in nodes.items:
+            if node.metadata.finalizers and 'kopf.zalando.org/KopfFinalizerMarker' in node.metadata.finalizers:
+                finalizers = [f for f in node.metadata.finalizers if f != 'kopf.zalando.org/KopfFinalizerMarker']
+                body = {"metadata": {"finalizers": finalizers if finalizers else None}}
+                core_v1.patch_node(node.metadata.name, body)
+                LOG.info(f"Removed Kopf finalizer from node {node.metadata.name}")
+    except Exception as e:
+        LOG.warning(f"Failed to clean finalizers: {e}")
+
+
 # ---------------- Reconciliation Logic ----------------
 def reconcile():
     """Main reconciliation logic — decide which deployment to scale."""
@@ -139,20 +153,26 @@ def reconcile():
 @kopf.on.startup()
 def startup(**_):
     LOG.info("AIGen Operator Started")
+    remove_node_finalizers()
 
 
-@kopf.on.event('', 'v1', 'nodes', use_finalizer=False)
-def on_node_event(**_):
-    """React immediately when nodes are added/removed."""
-    LOG.debug("Node event detected — triggering reconciliation.")
+@kopf.on.event('', 'v1', 'nodes')
+def on_node_event(type, name, **_):
+    """React immediately when nodes are added/removed/modified."""
+    LOG.debug(f"Node event: {type} on {name} — triggering reconciliation.")
     reconcile()
+    # Remove finalizers after reconciliation (if they appeared)
+    remove_node_finalizers()
 
 
-@kopf.timer('', 'v1', 'nodes', interval=RECONCILE_INTERVAL)
-def periodic(**_):
-    """Periodic sync in case of missed events or transient errors."""
+# REMOVED: @kopf.timer on nodes - this was causing Kopf to manage nodes
+# Instead, use a timer on the CR itself for periodic reconciliation
+@kopf.timer(CRD_GROUP, CRD_VERSION, CRD_PLURAL, interval=RECONCILE_INTERVAL, idle=RECONCILE_INTERVAL)
+def periodic_on_cr(**_):
+    """Periodic sync based on CR timer instead of node timer."""
     LOG.debug(f"Periodic reconciliation triggered (interval={RECONCILE_INTERVAL}s).")
     reconcile()
+
 
 @kopf.on.create(CRD_GROUP, CRD_VERSION, CRD_PLURAL)
 @kopf.on.update(CRD_GROUP, CRD_VERSION, CRD_PLURAL)
@@ -160,19 +180,3 @@ def on_cr_change(**_):
     """Reconcile when CR changes."""
     LOG.info("CR created or updated — triggering reconciliation.")
     reconcile()
-@kopf.on.delete('', 'v1', 'nodes')
-def on_node_delete(meta, **kwargs):
-    node_name = meta['name']
-    LOG.info(f"Node {node_name} is being deleted — removing Kopf finalizer if present.")
-
-    # Remove Kopf finalizer
-    try:
-        node = core_v1.read_node(node_name)
-        finalizers = node.metadata.finalizers or []
-        if 'kopf.zalando.org/KopfFinalizerMarker' in finalizers:
-            finalizers.remove('kopf.zalando.org/KopfFinalizerMarker')
-            core_v1.patch_node(node_name, {"metadata": {"finalizers": finalizers}})
-            LOG.info(f"Removed Kopf finalizer from {node_name}")
-    except Exception as e:
-        LOG.warning(f"Failed to remove finalizer from {node_name}: {e}")
-
