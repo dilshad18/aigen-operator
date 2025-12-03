@@ -351,7 +351,7 @@ def reconcile():
                 replicas
             )
         else:
-            LOG.info(f"No GPU nodes available ({cpu_node_count} CPU nodes), activating CPU deployment")
+            LOG.info(f"CPU nodes available ({cpu_node_count} CPU nodes), activating CPU deployment")
             scale_deployment(gpu_name, target_ns, 0)
             scale_deployment(cpu_name, target_ns, replicas)
             update_status(
