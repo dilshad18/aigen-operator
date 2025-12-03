@@ -46,8 +46,8 @@ spec:
 
 The operator updates the status field in the AIGen Custom Resource (CR) to reflect the current deployment state.
 ```bash
-NAME    ACTIVE DEPLOYMENT   NAMESPACE   REPLICAS   LAST SYNC                          REASON               AGE
-aigen   whiz-ai-gen-cpu     test        1          2025-11-12T09:12:57.813768+00:00   CPU nodes detected   2d14h
+NAME    ACTIVE DEPLOYMENT   NAMESPACE   REPLICAS   LAST SYNC                          MESSAGE                 AGE
+aigen   whiz-ai-gen-cpu     test        2          2025-12-03T10:02:59.425563+00:00   CPU nodes detected: 1   25h
 ```
 #### This shows:
 
