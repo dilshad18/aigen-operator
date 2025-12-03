@@ -28,9 +28,9 @@ spec:
         - name: Last Sync
           type: string
           jsonPath: .status.lastSyncTime
-        - name: Reason
+        - name: Message
           type: string
-          jsonPath: .status.reason
+          jsonPath: .status.message  
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -61,7 +61,7 @@ spec:
                   type: string
                 activeNamespace:
                   type: string
-                reason:
+                message:              
                   type: string
                 activeReplicas:
                   type: integer
