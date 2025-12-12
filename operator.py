@@ -337,7 +337,7 @@ def reconcile():
         gpu_node_count = len(gpu_nodes)
         cpu_node_count = len(nodes) - gpu_node_count
         
-        LOG.info(f"Cluster status: {len(nodes)} total nodes, {gpu_node_count} GPU-Node and schedulable, {cpu_node_count} CPU-Node")
+        LOG.info(f"Cluster status: {len(nodes)} total nodes, {gpu_node_count} GPU-Node, {cpu_node_count} CPU-Node")
         
         # Decide which deployment to activate
         if gpu_node_count > 0:
