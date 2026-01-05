@@ -208,17 +208,6 @@ def scale_deployment(name, namespace, replicas):
         raise
 
 
-def should_update_status(existing_status, new_values):
-    """
-    Check if status actually changed to avoid unnecessary updates.
-    Ignores lastSyncTime for comparison.
-    """
-    for key in ["activeDeployment", "activeNamespace", "message", "activeReplicas"]:
-        if existing_status.get(key) != new_values.get(key):
-            return True
-    return False
-
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -248,12 +237,7 @@ def update_status(active_deployment, target_ns, message, replicas):
         "activeReplicas": replicas,
     }
     
-    # Check if update is actually needed
-    if not should_update_status(existing_status, new_values):
-        LOG.debug("Status unchanged, skipping update")
-        return
-    
-    # Merge with existing status
+    # Always update to reflect latest sync time
     existing_status.update(new_values)
 
     try:
