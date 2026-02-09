@@ -67,7 +67,7 @@ reconcile_lock = threading.Lock()
 
 # ---------------- Node Event Debouncing ----------------
 last_reconcile_time = 0
-MIN_RECONCILE_INTERVAL = 30  # Minimum seconds between non-GPU-change node-triggered reconciles
+MIN_RECONCILE_INTERVAL = 120  # Minimum seconds between non-GPU-change node-triggered reconciles
 
 # ---------------- GPU Node State Tracking ----------------
 # Tracks which nodes are currently "effective GPU nodes" so we can detect
@@ -577,6 +577,8 @@ def startup(**_):
         f"  ║  CR Name   : {CR_NAME:<43}  ║  {C.RESET}\n"
         f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
         f"  ║  Reconcile : {str(RECONCILE_INTERVAL) + 's':<43}  ║  {C.RESET}\n"
+        f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
+        f"  ║  Debounce  : {str(MIN_RECONCILE_INTERVAL) + 's':<43}  ║  {C.RESET}\n"
         f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
         f"  ╚══════════════════════════════════════════════════════════╝  {C.RESET}"
     )
