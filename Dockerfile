@@ -1,21 +1,24 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine3.21
 
-# Avoid Python writing .pyc files and buffering logs
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system deps for pip
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# Update all packages to latest versions (fixes CVE-2025-15467)
+RUN apk upgrade --no-cache && \
+    apk add --no-cache gcc musl-dev
 
-# Install Python dependencies
+# Create non-root user
+RUN addgroup -S appuser && adduser -S appuser -G appuser
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy operator code
 COPY . .
+RUN chown -R appuser:appuser /app
+
+USER appuser
 
 CMD ["kopf", "run", "--standalone", "-A", "operator.py"]
