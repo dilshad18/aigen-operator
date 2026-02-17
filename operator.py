@@ -99,17 +99,46 @@ custom_api = client.CustomObjectsApi()
 
 
 # ---------------- Validation Functions ----------------
+def _validate_gpu_memory_field(value, field_path):
+    """Validate a requiredGpuMemoryGB field."""
+    if value is None:
+        raise ValueError(f"Missing required field: {field_path}")
+    if not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(
+            f"Invalid {field_path} value: {value}. "
+            "Must be a non-negative number (in GB)."
+        )
+
+
 def validate_cr_spec(spec):
     """Validate CR spec has required fields and valid values."""
-    required_fields = ["targetNamespace", "cpuDeployment", "gpuDeployment"]
+    # Top-level required fields
+    if "targetNamespace" not in spec or not spec["targetNamespace"]:
+        raise ValueError("Missing or empty required field: targetNamespace")
 
-    for field in required_fields:
-        if field not in spec or not spec[field]:
-            raise ValueError(f"Missing or empty required field: {field}")
+    # Validate llmDeployment
+    llm = spec.get("llmDeployment")
+    if not llm or not isinstance(llm, dict):
+        raise ValueError("Missing or invalid required field: llmDeployment")
+    if not llm.get("name"):
+        raise ValueError("Missing or empty required field: llmDeployment.name")
+    llm_replicas = llm.get("replicas", 1)
+    if not isinstance(llm_replicas, int) or llm_replicas < 0:
+        raise ValueError(f"Invalid llmDeployment.replicas value: {llm_replicas}. Must be non-negative integer.")
+    _validate_gpu_memory_field(llm.get("requiredGpuMemoryGB"), "llmDeployment.requiredGpuMemoryGB")
 
-    replicas = spec.get("replicas", 1)
-    if not isinstance(replicas, int) or replicas < 0:
-        raise ValueError(f"Invalid replicas value: {replicas}. Must be non-negative integer.")
+    # Validate textProcessingDeployment
+    tp = spec.get("textProcessingDeployment")
+    if not tp or not isinstance(tp, dict):
+        raise ValueError("Missing or invalid required field: textProcessingDeployment")
+    if not tp.get("cpuDeployment"):
+        raise ValueError("Missing or empty required field: textProcessingDeployment.cpuDeployment")
+    if not tp.get("gpuDeployment"):
+        raise ValueError("Missing or empty required field: textProcessingDeployment.gpuDeployment")
+    tp_replicas = tp.get("replicas", 1)
+    if not isinstance(tp_replicas, int) or tp_replicas < 0:
+        raise ValueError(f"Invalid textProcessingDeployment.replicas value: {tp_replicas}. Must be non-negative integer.")
+    _validate_gpu_memory_field(tp.get("requiredGpuMemoryGB"), "textProcessingDeployment.requiredGpuMemoryGB")
 
     LOG.debug(f"CR spec validated: {spec}")
     return True
@@ -129,6 +158,83 @@ def validate_deployment_exists(name, namespace):
         raise
 
 
+# ---------------- GPU Memory Helper Functions ----------------
+def get_node_gpu_memory_mb(node):
+    """
+    Read the nvidia.com/gpu.memory label from a node.
+    The label value is in MB.
+    Returns the value as a float, or 0.0 if the label is missing/invalid.
+    """
+    labels = node.metadata.labels or {}
+    gpu_memory_str = labels.get("nvidia.com/gpu.memory", "0")
+
+    try:
+        gpu_memory_mb = float(gpu_memory_str)
+        if gpu_memory_mb < 0:
+            LOG.warning(
+                f"Node {node.metadata.name} has negative gpu.memory label: {gpu_memory_str} MB, treating as 0"
+            )
+            return 0.0
+        return gpu_memory_mb
+    except (ValueError, TypeError):
+        LOG.warning(
+            f"Node {node.metadata.name} has invalid nvidia.com/gpu.memory label: '{gpu_memory_str}'"
+        )
+        return 0.0
+
+
+def get_node_gpu_count(node):
+    """
+    Get the number of GPUs on a node from allocatable resources or labels.
+    Returns an integer count.
+    """
+    allocatable = node.status.allocatable or {}
+    gpu_qty = allocatable.get("nvidia.com/gpu", "0")
+    try:
+        return max(int(gpu_qty), 0)
+    except (ValueError, TypeError):
+        return 0
+
+
+def calculate_total_gpu_memory_gb(gpu_nodes):
+    """
+    Calculate the total GPU memory and GPU count across all given GPU nodes.
+    Each node's nvidia.com/gpu.memory label reports per-GPU memory in MB.
+    Total = sum(per_gpu_memory_mb * gpu_count) for each node, converted to GB.
+
+    Returns:
+        (total_gb, total_gpu_count, details) where details is a list of dicts with per-node info.
+    """
+    total_memory_mb = 0.0
+    total_gpu_count = 0
+    node_details = []
+
+    for node in gpu_nodes:
+        node_name = node.metadata.name
+        per_gpu_memory_mb = get_node_gpu_memory_mb(node)
+        gpu_count = get_node_gpu_count(node)
+        node_total_mb = per_gpu_memory_mb * gpu_count
+
+        total_memory_mb += node_total_mb
+        total_gpu_count += gpu_count
+
+        node_details.append({
+            "name": node_name,
+            "gpu_count": gpu_count,
+            "per_gpu_memory_mb": per_gpu_memory_mb,
+            "total_memory_mb": node_total_mb,
+            "total_memory_gb": round(node_total_mb / 1024, 2),
+        })
+
+        LOG.debug(
+            f"Node {node_name}: {gpu_count} GPU(s) × {per_gpu_memory_mb:.0f} MB = "
+            f"{node_total_mb:.0f} MB ({node_total_mb / 1024:.2f} GB)"
+        )
+
+    total_gb = round(total_memory_mb / 1024, 2)
+    return total_gb, total_gpu_count, node_details
+
+
 # ---------------- Helper Functions ----------------
 def is_gpu_node(node):
     """
@@ -137,7 +243,7 @@ def is_gpu_node(node):
     - Node is not cordoned/unschedulable
     - Node has no blocking taints
     - Node is in Ready state
-    - Node has GPU resources (labels or allocatable)
+    - Node has nvidia.com/gpu.memory label with a value > 0
     """
     node_name = node.metadata.name
 
@@ -165,24 +271,15 @@ def is_gpu_node(node):
         LOG.debug(f"Node {node_name} is not in Ready state")
         return False
 
-    # Check for GPU presence via labels
+    # Check for GPU via nvidia.com/gpu.memory label (source of truth)
     labels = node.metadata.labels or {}
-    if labels.get("nvidia.com/gpu.present") == "true":
-        LOG.debug(f"Node {node_name} has GPU label")
-        return True
-
-    # Check for GPU allocatable resources
-    allocatable = node.status.allocatable or {}
-    gpu_qty = allocatable.get("nvidia.com/gpu", "0")
-
+    gpu_memory_str = labels.get("nvidia.com/gpu.memory", "0")
     try:
-        gpu_count = int(gpu_qty)
-        if gpu_count > 0:
-            LOG.debug(f"Node {node_name} has {gpu_count} allocatable GPUs")
+        if float(gpu_memory_str) > 0:
+            LOG.debug(f"Node {node_name} has GPU memory label: {gpu_memory_str} MB")
             return True
     except (ValueError, TypeError):
-        LOG.warning(f"Invalid GPU quantity for node {node_name}: {gpu_qty}")
-        return False
+        pass
 
     return False
 
@@ -228,18 +325,12 @@ def _is_effective_gpu_node_from_body(body):
         LOG.debug(f"[gpu-track] Node {node_name} is not Ready")
         return False
 
-    # Check GPU label
+    # Check for GPU via nvidia.com/gpu.memory label (source of truth)
     labels = body.get('metadata', {}).get('labels') or {}
-    if labels.get('nvidia.com/gpu.present') == 'true':
-        LOG.debug(f"[gpu-track] Node {node_name} has GPU label")
-        return True
-
-    # Check GPU allocatable resources
-    allocatable = status.get('allocatable') or {}
-    gpu_qty = allocatable.get('nvidia.com/gpu', '0')
+    gpu_memory_str = labels.get('nvidia.com/gpu.memory', '0')
     try:
-        if int(gpu_qty) > 0:
-            LOG.debug(f"[gpu-track] Node {node_name} has allocatable GPUs")
+        if float(gpu_memory_str) > 0:
+            LOG.debug(f"[gpu-track] Node {node_name} has GPU memory label: {gpu_memory_str} MB")
             return True
     except (ValueError, TypeError):
         pass
@@ -335,7 +426,6 @@ def scale_deployment(name, namespace, replicas):
 
         # Colorful scaling log — stands out in kubectl logs
         if replicas > 0 and current_replicas == 0:
-            # Scale UP from zero — big green banner
             LOG.info(
                 f"\n"
                 f"{C.BOLD}{C.BG_GREEN}{C.WHITE}"
@@ -343,7 +433,6 @@ def scale_deployment(name, namespace, replicas):
                 f"{C.RESET}"
             )
         elif replicas == 0 and current_replicas > 0:
-            # Scale DOWN to zero — big red banner
             LOG.info(
                 f"\n"
                 f"{C.BOLD}{C.BG_RED}{C.WHITE}"
@@ -351,12 +440,10 @@ def scale_deployment(name, namespace, replicas):
                 f"{C.RESET}"
             )
         elif replicas > current_replicas:
-            # Scale UP (partial) — green text
             LOG.info(
                 f"{C.GREEN}{C.BOLD}  ▲ SCALED  {name}  │  {current_replicas} → {replicas} replicas  │  ns: {namespace}{C.RESET}"
             )
         elif replicas < current_replicas:
-            # Scale DOWN (partial) — yellow text
             LOG.info(
                 f"{C.YELLOW}{C.BOLD}  ▼ SCALED  {name}  │  {current_replicas} → {replicas} replicas  │  ns: {namespace}{C.RESET}"
             )
@@ -375,8 +462,16 @@ def scale_deployment(name, namespace, replicas):
     retry=retry_if_exception_type(ApiException),
     reraise=True
 )
-def update_status(active_deployment, target_ns, message, replicas):
-    """Update CR status without overwriting Kopf-managed fields."""
+def update_status(target_ns, message, deployments,
+                  total_gpu_memory_gb=None, total_gpu_count=None,
+                  gpu_node_count=None, cpu_node_count=None):
+    """
+    Update CR status with a deployments list and cluster info.
+
+    Args:
+        deployments: list of dicts, each with keys:
+            workload, name, mode, replicas, requiredGpuMemoryGB, gpuMemoryMet
+    """
     now = datetime.now(timezone.utc).isoformat()
 
     try:
@@ -390,15 +485,27 @@ def update_status(active_deployment, target_ns, message, replicas):
             return
         existing_status = {}
 
+    # Build human-readable summary for the printer column
+    # e.g. "ai-llm(gpu/1) ai-text-proc-gpu(gpu/2)"
+    summary_parts = []
+    for d in deployments:
+        summary_parts.append(f"{d['name']}({d['mode']}/{d['replicas']})")
+    deployment_summary = "  ".join(summary_parts)
+
     new_values = {
         "lastSyncTime": now,
-        "activeDeployment": active_deployment,
-        "activeNamespace": target_ns,
+        "namespace": target_ns,
         "message": message,
-        "activeReplicas": replicas,
+        "deploymentSummary": deployment_summary,
+        "cluster": {
+            "totalGpuCount": total_gpu_count or 0,
+            "totalGpuMemoryGB": total_gpu_memory_gb or 0,
+            "gpuNodeCount": gpu_node_count or 0,
+            "cpuNodeCount": cpu_node_count or 0,
+        },
+        "deployments": deployments,
     }
 
-    # Always update to reflect latest sync time
     existing_status.update(new_values)
 
     try:
@@ -411,7 +518,7 @@ def update_status(active_deployment, target_ns, message, replicas):
             body={"status": existing_status},
             field_manager="aigen-operator",
         )
-        LOG.info(f"Updated CR status: deployment={active_deployment}, replicas={replicas}, message={message}")
+        LOG.info(f"Updated CR status: {deployment_summary}")
     except ApiException as e:
         LOG.warning(f"Failed to update CR status: {e.reason} (status: {e.status})")
         raise
@@ -449,9 +556,21 @@ def remove_node_finalizers():
 def reconcile():
     """
     Main reconciliation logic with locking to prevent concurrent execution.
-    Decides which deployment (CPU or GPU) should be active based on available nodes.
+
+    Manages two workloads, each with its own requiredGpuMemoryGB threshold:
+
+      1. ai-llm (LLM):  GPU-only.
+         - If total GPU memory >= llmDeployment.requiredGpuMemoryGB → scale UP.
+         - Otherwise → scale to 0.
+
+      2. ai-text-processing: Has a CPU and GPU variant.
+         - If total GPU memory >= textProcessingDeployment.requiredGpuMemoryGB
+           → GPU variant UP, CPU variant DOWN.
+         - Otherwise → CPU variant UP, GPU variant DOWN.
+
+    Each deployment is evaluated independently, so it's possible for the LLM
+    to be off while text-processing runs on GPU (or vice-versa).
     """
-    # Prevent concurrent reconciliations
     if not reconcile_lock.acquire(blocking=False):
         LOG.debug("Reconciliation already in progress, skipping")
         return
@@ -459,98 +578,154 @@ def reconcile():
     try:
         LOG.debug("Starting reconciliation")
 
-        # Fetch and validate CR spec
+        # ---- Fetch and validate CR spec ----
         spec = get_cr_spec()
         target_ns = spec["targetNamespace"]
-        cpu_name = spec["cpuDeployment"]
-        gpu_name = spec["gpuDeployment"]
-        replicas = spec.get("replicas", 1)
 
-        # Validate both deployments exist
-        cpu_exists = validate_deployment_exists(cpu_name, target_ns)
-        gpu_exists = validate_deployment_exists(gpu_name, target_ns)
+        llm_cfg = spec["llmDeployment"]
+        llm_name = llm_cfg["name"]
+        llm_replicas = llm_cfg.get("replicas", 1)
+        llm_required_gb = llm_cfg["requiredGpuMemoryGB"]
 
-        if not cpu_exists or not gpu_exists:
-            error_msg = f"Required deployment(s) not found: cpu={cpu_exists}, gpu={gpu_exists}"
+        tp_cfg = spec["textProcessingDeployment"]
+        tp_cpu_name = tp_cfg["cpuDeployment"]
+        tp_gpu_name = tp_cfg["gpuDeployment"]
+        tp_replicas = tp_cfg.get("replicas", 1)
+        tp_required_gb = tp_cfg["requiredGpuMemoryGB"]
+
+        # ---- Validate all deployments exist ----
+        all_deployments = {
+            "llm (GPU)": llm_name,
+            "textProcessing (CPU)": tp_cpu_name,
+            "textProcessing (GPU)": tp_gpu_name,
+        }
+        missing = []
+        for label, dep_name in all_deployments.items():
+            if not validate_deployment_exists(dep_name, target_ns):
+                missing.append(f"{label}={dep_name}")
+
+        if missing:
+            error_msg = f"Required deployment(s) not found: {', '.join(missing)}"
             LOG.error(error_msg)
-            update_status("none", target_ns, error_msg, 0)
+            update_status(target_ns, error_msg, [
+                {"workload": "llm", "name": llm_name, "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": llm_required_gb, "gpuMemoryMet": False},
+                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": tp_required_gb, "gpuMemoryMet": False},
+            ])
             return
 
-        # Check for GPU and CPU nodes
+        # ---- Discover GPU nodes ----
         nodes = core_v1.list_node().items
         gpu_nodes = [n for n in nodes if is_gpu_node(n)]
         gpu_node_count = len(gpu_nodes)
         cpu_node_count = len(nodes) - gpu_node_count
 
-        # ---- Colorful cluster status ----
-        LOG.info(
-            f"{C.CYAN}{C.BOLD}  CLUSTER STATUS  "
-            f"{C.RESET}{C.CYAN}│  "
-            f"Total: {len(nodes)}  │  "
-            f"{C.GREEN}GPU: {gpu_node_count}{C.CYAN}  │  "
-            f"{C.BLUE}CPU: {cpu_node_count}"
-            f"{C.RESET}"
-        )
+        # ---- Calculate total GPU memory ----
+        total_gpu_memory_gb, total_gpu_count, gpu_node_details = calculate_total_gpu_memory_gb(gpu_nodes)
 
-        # Decide which deployment to activate
-        if gpu_node_count > 0:
-            # ---- GPU MODE banner ----
-            gpu_node_names = [n.metadata.name for n in gpu_nodes]
-            LOG.info(
-                f"\n"
-                f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
-                f"  ╔══════════════════════════════════════════════════════════╗  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
-                f"  ║         SWITCHING TO GPU MODE                           ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
-                f"  ║  Active : {gpu_name:<46}  ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
-                f"  ║  Replicas: {replicas:<45}  ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
-                f"  ║  GPU Nodes: {', '.join(gpu_node_names):<44}  ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
-                f"  ╚══════════════════════════════════════════════════════════╝  {C.RESET}"
-            )
-            scale_deployment(gpu_name, target_ns, replicas)
-            scale_deployment(cpu_name, target_ns, 0)
-            update_status(
-                gpu_name,
-                target_ns,
-                f"GPU nodes: {gpu_node_count}, CPU nodes: {cpu_node_count}",
-                replicas
-            )
+        # ---- Per-deployment GPU memory checks ----
+        llm_gpu_met = (gpu_node_count > 0 and total_gpu_memory_gb >= llm_required_gb)
+        tp_gpu_met = (gpu_node_count > 0 and total_gpu_memory_gb >= tp_required_gb)
+
+        # ================================================================
+        # SCALING DECISIONS (per-deployment, independent)
+        # ================================================================
+
+        # ---- LLM Decision ----
+        if llm_gpu_met:
+            llm_mode = "gpu"
+            llm_target_replicas = llm_replicas
+            llm_message = f"GPU memory met ({total_gpu_memory_gb:.2f}>={llm_required_gb:.2f} GB), scaled to {llm_replicas}"
         else:
-            # ---- CPU MODE banner ----
-            LOG.info(
-                f"\n"
-                f"{C.BOLD}{C.BG_BLUE}{C.WHITE}"
-                f"  ╔══════════════════════════════════════════════════════════╗  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_BLUE}{C.WHITE}"
-                f"  ║         SWITCHING TO CPU MODE                           ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_BLUE}{C.WHITE}"
-                f"  ║  Active : {cpu_name:<46}  ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_BLUE}{C.WHITE}"
-                f"  ║  Replicas: {replicas:<45}  ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_BLUE}{C.WHITE}"
-                f"  ║  GPU Nodes: {'0 (none available)':<44}  ║  {C.RESET}\n"
-                f"{C.BOLD}{C.BG_BLUE}{C.WHITE}"
-                f"  ╚══════════════════════════════════════════════════════════╝  {C.RESET}"
-            )
-            scale_deployment(gpu_name, target_ns, 0)
-            scale_deployment(cpu_name, target_ns, replicas)
-            update_status(
-                cpu_name,
-                target_ns,
-                f"GPU nodes: {gpu_node_count}, CPU nodes: {cpu_node_count}",
-                replicas
-            )
+            llm_mode = "off"
+            llm_target_replicas = 0
+            if gpu_node_count > 0:
+                llm_message = f"GPU memory insufficient ({total_gpu_memory_gb:.2f}<{llm_required_gb:.2f} GB), scaled to 0"
+            else:
+                llm_message = f"No GPU nodes available, scaled to 0"
+
+        # ---- Text-Processing Decision ----
+        if tp_gpu_met:
+            tp_mode = "gpu"
+            tp_active_name = tp_gpu_name
+            tp_inactive_name = tp_cpu_name
+            tp_target_replicas = tp_replicas
+            tp_message = f"GPU memory met ({total_gpu_memory_gb:.2f}>={tp_required_gb:.2f} GB), using GPU variant"
+        else:
+            tp_mode = "cpu"
+            tp_active_name = tp_cpu_name
+            tp_inactive_name = tp_gpu_name
+            tp_target_replicas = tp_replicas
+            if gpu_node_count > 0:
+                tp_message = f"GPU memory insufficient ({total_gpu_memory_gb:.2f}<{tp_required_gb:.2f} GB), using CPU variant"
+            else:
+                tp_message = f"No GPU nodes available, using CPU variant"
+
+        # ---- Reconciliation plan banner (deployments + thresholds only) ----
+        B = f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
+        R = C.RESET
+        LOG.info(
+            f"\n"
+            f"{B}  ╔══════════════════════════════════════════════════════════════════════════╗  {R}\n"
+            f"{B}  ║                       RECONCILIATION STATUS                               ║  {R}\n"
+            f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
+            f"{B}  ║  WORKLOAD            │ DEPLOYMENT                │ REPLICAS │ MODE      ║  {R}\n"
+            f"{B}  ║  ai-llm              │ {llm_name:<25} │ {llm_target_replicas:<8} │ {llm_mode:<9} ║  {R}\n"
+            f"{B}  ║  ai-text-processing  │ {tp_active_name:<25} │ {tp_target_replicas:<8} │ {tp_mode:<9} ║  {R}\n"
+            f"{B}  ║  ai-text-processing  │ {tp_inactive_name:<25} │ {'0':<8} │ {'off':<9} ║  {R}\n"
+            f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
+            f"{B}  ║  Thresholds: LLM={llm_required_gb:.0f}GB ({'MET' if llm_gpu_met else 'NOT MET'})"
+            f"  │  TextProcessing={tp_required_gb:.0f}GB ({'MET' if tp_gpu_met else 'NOT MET'})"
+            f"{' ' * max(0, 11 - len(f'{llm_required_gb:.0f}') - len(f'{tp_required_gb:.0f}'))}║  {R}\n"
+            f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
+            f"{B}  ║  CLUSTER STATUS                                                          ║  {R}\n"
+            f"{B}  ║  Nodes: {len(nodes):<5} │ GPU Nodes: {gpu_node_count:<5} │ CPU Nodes: {cpu_node_count:<5} │ GPUs: {total_gpu_count:<5} │ Mem: {total_gpu_memory_gb:.2f} GB  ║  {R}\n"
+            f"{B}  ╚══════════════════════════════════════════════════════════════════════════╝  {R}"
+        )
+        if gpu_node_details:
+            for detail in gpu_node_details:
+                LOG.info(
+                    f"{C.DIM}    └─ {detail['name']}: "
+                    f"{detail['gpu_count']} GPU(s) × {detail['per_gpu_memory_mb']:.0f} MB = "
+                    f"{detail['total_memory_gb']:.2f} GB{C.RESET}"
+                )
+
+        # ---- Execute scaling ----
+        scale_deployment(llm_name, target_ns, llm_target_replicas)
+        scale_deployment(tp_active_name, target_ns, tp_target_replicas)
+        scale_deployment(tp_inactive_name, target_ns, 0)
+
+        # ---- Build status message ----
+        msg = f"Sync successful: llm={llm_mode}, textProcessing={tp_mode}"
+
+        update_status(
+            target_ns, msg,
+            [
+                {"workload": "llm", "name": llm_name, "mode": llm_mode,
+                 "replicas": llm_target_replicas, "requiredGpuMemoryGB": llm_required_gb,
+                 "gpuMemoryMet": llm_gpu_met, "message": llm_message},
+                {"workload": "textProcessing", "name": tp_active_name, "mode": tp_mode,
+                 "replicas": tp_target_replicas, "requiredGpuMemoryGB": tp_required_gb,
+                 "gpuMemoryMet": tp_gpu_met, "message": tp_message},
+            ],
+            total_gpu_memory_gb=total_gpu_memory_gb,
+            total_gpu_count=total_gpu_count,
+            gpu_node_count=gpu_node_count,
+            cpu_node_count=cpu_node_count,
+        )
 
         LOG.info(f"{C.GREEN}{C.BOLD}  ✓ Reconciliation completed successfully{C.RESET}")
 
     except ValueError as e:
         LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  Validation error: {e}{C.RESET}")
         try:
-            update_status("error", "", str(e), 0)
+            update_status("", str(e), [
+                {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+            ])
         except Exception:
             pass
     except ApiException as e:
@@ -594,6 +769,17 @@ def startup(**_):
                 if is_gpu_node(node):
                     _known_gpu_nodes.add(node.metadata.name)
         LOG.info(f"Initial GPU node tracking: {len(_known_gpu_nodes)} GPU node(s) detected: {_known_gpu_nodes or '{none}'}")
+
+        # Log initial GPU memory info
+        gpu_nodes = [n for n in nodes if is_gpu_node(n)]
+        if gpu_nodes:
+            total_gb, total_count, details = calculate_total_gpu_memory_gb(gpu_nodes)
+            LOG.info(f"Initial total GPU memory: {total_gb:.2f} GB ({total_count} GPUs across {len(gpu_nodes)} node(s))")
+            for d in details:
+                LOG.info(
+                    f"  └─ {d['name']}: {d['gpu_count']} GPU(s) × "
+                    f"{d['per_gpu_memory_mb']:.0f} MB = {d['total_memory_gb']:.2f} GB"
+                )
     except Exception as e:
         LOG.warning(f"Failed to initialize GPU node tracking: {e}")
 
@@ -626,9 +812,7 @@ def on_node_event(type, body, name, **_):
     Strategy:
     - ADDED/DELETED: Always trigger immediate reconciliation.
     - MODIFIED with GPU state change: Trigger immediate reconciliation
-      (bypasses debounce). This is the key fix — when NVIDIA device plugin
-      labels a node with GPU resources, we detect the transition and react
-      within seconds instead of waiting for the periodic timer.
+      (bypasses debounce).
     - MODIFIED (no GPU change): Debounce with MIN_RECONCILE_INTERVAL.
     """
     global last_reconcile_time
@@ -640,7 +824,6 @@ def on_node_event(type, body, name, **_):
     gpu_state_changed = _update_gpu_tracking(name, body, type)
 
     if type in ['ADDED', 'DELETED']:
-        # Always reconcile immediately for node additions/deletions
         color = C.GREEN if type == 'ADDED' else C.RED
         LOG.info(f"{color}{C.BOLD}  ● NODE {type}: {name}{C.RESET} — triggering immediate reconciliation")
         reconcile()
@@ -649,7 +832,6 @@ def on_node_event(type, body, name, **_):
 
     elif type == 'MODIFIED':
         if gpu_state_changed:
-            # GPU state changed — bypass debounce, reconcile NOW
             LOG.info(
                 f"\n"
                 f"{C.BOLD}{C.BG_YELLOW}{C.WHITE}"
@@ -660,13 +842,11 @@ def on_node_event(type, body, name, **_):
             remove_node_finalizers()
             last_reconcile_time = time.time()
         elif time_since_last >= MIN_RECONCILE_INTERVAL:
-            # Enough time has passed, reconcile for non-GPU changes
             LOG.info(f"{C.CYAN}  ● Node MODIFIED: {name}{C.RESET} — triggering reconciliation ({time_since_last:.1f}s since last)")
             reconcile()
             remove_node_finalizers()
             last_reconcile_time = time.time()
         else:
-            # Too soon, skip this event
             LOG.debug(
                 f"Node MODIFIED: {name} — skipping reconciliation "
                 f"(last reconcile {time_since_last:.1f}s ago, min interval: {MIN_RECONCILE_INTERVAL}s)"
@@ -692,7 +872,6 @@ def on_cr_change(spec, old, new, **_):
     if old is None:
         LOG.info(f"CR {CR_NAME} created — triggering reconciliation")
     else:
-        # Log what changed
         changed_fields = []
         for key in spec.keys():
             if old.get(key) != new.get(key):

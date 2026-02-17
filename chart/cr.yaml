@@ -1,11 +1,17 @@
----
 apiVersion: infra.whiz.ai/v1
 kind: AIGen
 metadata:
   name: aigen
-  namespace: default #namespace
 spec:
-  targetNamespace: test
-  cpuDeployment: whiz-ai-gen-cpu
-  gpuDeployment: whiz-ai-gen-gpu
-  replicas: 2
+  targetNamespace: my-app
+
+  llmDeployment:
+    name: ai-llm
+    replicas: 1
+    requiredGpuMemoryGB: 80
+
+  textProcessingDeployment:
+    cpuDeployment: ai-text-processing-cpu
+    gpuDeployment: ai-text-processing-gpu
+    replicas: 2
+    requiredGpuMemoryGB: 40
