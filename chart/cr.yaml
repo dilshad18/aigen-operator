@@ -3,7 +3,7 @@ kind: AIGen
 metadata:
   name: aigen
 spec:
-  targetNamespace: my-app
+  targetNamespace: test
 
   llmDeployment:
     name: ai-llm
@@ -13,5 +13,5 @@ spec:
   textProcessingDeployment:
     cpuDeployment: ai-text-processing-cpu
     gpuDeployment: ai-text-processing-gpu
-    replicas: 2
+    replicas: 1
     requiredGpuMemoryGB: 40

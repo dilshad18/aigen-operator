@@ -20,6 +20,11 @@ logging.getLogger().setLevel(log_level)
 
 LOG = logging.getLogger("aigen-operator")
 LOG.setLevel(log_level)
+
+# Suppress noisy kopf internal loggers -- they log "Handler succeeded" for every object event
+logging.getLogger("kopf.objects").setLevel(logging.WARNING)
+logging.getLogger("kopf.activities").setLevel(logging.WARNING)
+
 LOG.info(f"Logging initialized at level: {log_level}")
 
 # Configurable reconcile interval (default: 60 seconds)
@@ -61,6 +66,8 @@ CRD_VERSION = "v1"
 CRD_PLURAL = "aigens"
 OPERATOR_NAMESPACE = os.getenv("OPERATOR_NAMESPACE", "whiz-operator")
 CR_NAME = os.getenv("CR_NAME", "aigen")
+MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+MANAGED_BY_VALUE = "aigen-operator"
 
 # ---------------- Reconciliation Lock ----------------
 reconcile_lock = threading.Lock()
@@ -398,6 +405,23 @@ def get_cr_spec():
         raise
 
 
+def label_managed_deployment(name, namespace):
+    """Inject the managed-by label onto a deployment so the drift watcher can filter on it."""
+    try:
+        deploy = apps_v1.read_namespaced_deployment(name, namespace)
+        labels = deploy.metadata.labels or {}
+        if labels.get(MANAGED_BY_LABEL) == MANAGED_BY_VALUE:
+            return
+        body = {"metadata": {"labels": {MANAGED_BY_LABEL: MANAGED_BY_VALUE}}}
+        apps_v1.patch_namespaced_deployment(name, namespace, body)
+        LOG.debug(f"Labeled deployment {name} with {MANAGED_BY_LABEL}={MANAGED_BY_VALUE}")
+    except ApiException as e:
+        if e.status == 404:
+            LOG.debug(f"Deployment {name} not found, skipping label injection")
+        else:
+            LOG.warning(f"Failed to label deployment {name}: {e.reason}")
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -418,9 +442,14 @@ def scale_deployment(name, namespace, replicas):
 
         if current_replicas == replicas:
             LOG.debug(f"Deployment {name} already at {replicas} replicas, skipping scale")
+            with _expected_replicas_lock:
+                _expected_replicas[name] = replicas
             return
 
-        # Perform the scale operation
+        # Record expected state before scaling to avoid drift false positives
+        with _expected_replicas_lock:
+            _expected_replicas[name] = replicas
+
         body = {"spec": {"replicas": replicas}}
         apps_v1.patch_namespaced_deployment_scale(name, namespace, body)
 
@@ -615,6 +644,10 @@ def reconcile():
             ])
             return
 
+        # ---- Inject managed-by labels onto deployments ----
+        for dep_name in [llm_name, tp_cpu_name, tp_gpu_name]:
+            label_managed_deployment(dep_name, target_ns)
+
         # ---- Discover GPU nodes ----
         nodes = core_v1.list_node().items
         gpu_nodes = [n for n in nodes if is_gpu_node(n)]
@@ -736,6 +769,19 @@ def reconcile():
         reconcile_lock.release()
 
 
+# ---------------- Kopf Configuration ----------------
+@kopf.on.startup()
+def configure(settings: kopf.OperatorSettings, **_):
+    """Configure kopf threading, peering, and namespace scoping."""
+    settings.posting.level = logging.WARNING
+    settings.watching.server_timeout = 270
+    settings.watching.client_timeout = 300
+    settings.execution.max_workers = 2
+    settings.peering.standalone = True
+
+    LOG.info(f"Kopf configured: max_workers=2, namespace={OPERATOR_NAMESPACE}")
+
+
 # ---------------- Kopf Event Hooks ----------------
 @kopf.on.startup()
 def startup(**_):
@@ -809,18 +855,16 @@ def on_node_event(type, body, name, **_):
     """
     React to node events with GPU-aware debouncing.
 
-    Strategy:
+    Only reacts to:
     - ADDED/DELETED: Always trigger immediate reconciliation.
-    - MODIFIED with GPU state change: Trigger immediate reconciliation
-      (bypasses debounce).
-    - MODIFIED (no GPU change): Debounce with MIN_RECONCILE_INTERVAL.
+    - MODIFIED with GPU state change: Trigger immediate reconciliation.
+    All other MODIFIED events are ignored to avoid API server pressure.
     """
     global last_reconcile_time
 
-    current_time = time.time()
-    time_since_last = current_time - last_reconcile_time
+    if type is None:
+        return
 
-    # Update GPU tracking and detect state changes
     gpu_state_changed = _update_gpu_tracking(name, body, type)
 
     if type in ['ADDED', 'DELETED']:
@@ -830,29 +874,43 @@ def on_node_event(type, body, name, **_):
         remove_node_finalizers()
         last_reconcile_time = time.time()
 
-    elif type == 'MODIFIED':
-        if gpu_state_changed:
-            LOG.info(
-                f"\n"
-                f"{C.BOLD}{C.BG_YELLOW}{C.WHITE}"
-                f"  ⚡ GPU STATE CHANGE DETECTED  │  Node: {name}  │  Bypassing debounce — reconciling NOW  "
-                f"{C.RESET}"
-            )
-            reconcile()
-            remove_node_finalizers()
-            last_reconcile_time = time.time()
-        elif time_since_last >= MIN_RECONCILE_INTERVAL:
-            LOG.info(f"{C.CYAN}  ● Node MODIFIED: {name}{C.RESET} — triggering reconciliation ({time_since_last:.1f}s since last)")
-            reconcile()
-            remove_node_finalizers()
-            last_reconcile_time = time.time()
-        else:
-            LOG.debug(
-                f"Node MODIFIED: {name} — skipping reconciliation "
-                f"(last reconcile {time_since_last:.1f}s ago, min interval: {MIN_RECONCILE_INTERVAL}s)"
-            )
+    elif type == 'MODIFIED' and gpu_state_changed:
+        LOG.info(
+            f"\n"
+            f"{C.BOLD}{C.BG_YELLOW}{C.WHITE}"
+            f"  ⚡ GPU STATE CHANGE DETECTED  │  Node: {name}  │  Reconciling NOW  "
+            f"{C.RESET}"
+        )
+        reconcile()
+        remove_node_finalizers()
+        last_reconcile_time = time.time()
     else:
-        LOG.debug(f"Node event {type}: {name} — ignoring unknown event type")
+        LOG.debug(f"Node event {type}: {name} — no GPU change, skipping")
+
+
+# Track expected replica state to avoid reconcile loops from our own scaling
+_expected_replicas = {}
+_expected_replicas_lock = threading.Lock()
+
+
+@kopf.on.event('apps', 'v1', 'deployments', labels={MANAGED_BY_LABEL: MANAGED_BY_VALUE})
+def on_deployment_event(name, namespace, body, type, **_):
+    """Detect manual scaling drift on managed deployments and correct immediately."""
+    if type is None:
+        return
+
+    current_replicas = body.get("spec", {}).get("replicas")
+    with _expected_replicas_lock:
+        expected = _expected_replicas.get(name)
+
+    if expected is not None and current_replicas == expected:
+        return
+
+    LOG.info(
+        f"{C.YELLOW}{C.BOLD}  ⚠ DRIFT DETECTED  │  {name}  │  "
+        f"expected={expected}  actual={current_replicas}  │  Reconciling{C.RESET}"
+    )
+    reconcile()
 
 
 @kopf.timer(CRD_GROUP, CRD_VERSION, CRD_PLURAL, interval=RECONCILE_INTERVAL, idle=RECONCILE_INTERVAL)
