@@ -1,7 +1,6 @@
 import os
 import logging
 import kopf
-import time
 import threading
 from datetime import datetime, timezone
 from kubernetes import client, config
@@ -71,10 +70,6 @@ MANAGED_BY_VALUE = "aigen-operator"
 
 # ---------------- Reconciliation Lock ----------------
 reconcile_lock = threading.Lock()
-
-# ---------------- Node Event Debouncing ----------------
-last_reconcile_time = 0
-MIN_RECONCILE_INTERVAL = 120  # Minimum seconds between non-GPU-change node-triggered reconciles
 
 # ---------------- GPU Node State Tracking ----------------
 # Tracks which nodes are currently "effective GPU nodes" so we can detect
@@ -259,10 +254,11 @@ def is_gpu_node(node):
         LOG.debug(f"Node {node_name} is unschedulable (cordoned)")
         return False
 
-    # Check for blocking taints
+    # Check for blocking taints (allow GPU-specific taints)
+    GPU_TAINT_KEYS = {"nvidia.com/gpu", "nvidia.com/gpu.present", "nvidia.com/gpu.memory"}
     taints = node.spec.taints or []
     for taint in taints:
-        if taint.effect in ["NoSchedule", "NoExecute"]:
+        if taint.effect in ["NoSchedule", "NoExecute"] and taint.key not in GPU_TAINT_KEYS:
             LOG.debug(f"Node {node_name} has blocking taint: {taint.key}={taint.value}:{taint.effect}")
             return False
 
@@ -307,15 +303,18 @@ def _is_effective_gpu_node_from_body(body):
         LOG.debug(f"[gpu-track] Node {node_name} is unschedulable")
         return False
 
-    # Check for blocking taints
+    # Check for blocking taints (allow GPU-specific taints)
+    GPU_TAINT_KEYS = {"nvidia.com/gpu", "nvidia.com/gpu.present", "nvidia.com/gpu.memory"}
     taints = spec.get('taints') or []
     for taint in taints:
         if isinstance(taint, dict):
             effect = taint.get('effect', '')
+            key = taint.get('key', '')
         else:
             effect = getattr(taint, 'effect', '')
-        if effect in ['NoSchedule', 'NoExecute']:
-            LOG.debug(f"[gpu-track] Node {node_name} has blocking taint")
+            key = getattr(taint, 'key', '')
+        if effect in ['NoSchedule', 'NoExecute'] and key not in GPU_TAINT_KEYS:
+            LOG.debug(f"[gpu-track] Node {node_name} has blocking taint: {key}")
             return False
 
     # Check Ready condition
@@ -408,10 +407,6 @@ def get_cr_spec():
 def label_managed_deployment(name, namespace):
     """Inject the managed-by label onto a deployment so the drift watcher can filter on it."""
     try:
-        deploy = apps_v1.read_namespaced_deployment(name, namespace)
-        labels = deploy.metadata.labels or {}
-        if labels.get(MANAGED_BY_LABEL) == MANAGED_BY_VALUE:
-            return
         body = {"metadata": {"labels": {MANAGED_BY_LABEL: MANAGED_BY_VALUE}}}
         apps_v1.patch_namespaced_deployment(name, namespace, body)
         LOG.debug(f"Labeled deployment {name} with {MANAGED_BY_LABEL}={MANAGED_BY_VALUE}")
@@ -581,6 +576,19 @@ def remove_node_finalizers():
         LOG.warning(f"Failed to clean node finalizers: {e}")
 
 
+def _update_error_status(error_msg):
+    """Write an error status to the CR. Used by reconcile exception handlers."""
+    try:
+        update_status(OPERATOR_NAMESPACE, error_msg, [
+            {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
+             "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+            {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
+             "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+        ])
+    except Exception:
+        pass
+
+
 # ---------------- Reconciliation Logic ----------------
 def reconcile():
     """
@@ -639,9 +647,16 @@ def reconcile():
             LOG.warning(f"Missing deployment(s): {', '.join(missing)}")
 
         # ---- Inject managed-by labels onto existing deployments ----
+        managed_names = {llm_name, tp_cpu_name, tp_gpu_name}
         for dep_name, exists in [(llm_name, llm_exists), (tp_cpu_name, tp_cpu_exists), (tp_gpu_name, tp_gpu_exists)]:
             if exists:
                 label_managed_deployment(dep_name, target_ns)
+
+        # ---- Clean stale entries from expected replicas tracker ----
+        with _expected_replicas_lock:
+            stale = [k for k in _expected_replicas if k not in managed_names]
+            for k in stale:
+                del _expected_replicas[k]
 
         # ---- Discover GPU nodes ----
         nodes = core_v1.list_node().items
@@ -805,60 +820,28 @@ def reconcile():
 
     except ValueError as e:
         LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  Validation error: {e}{C.RESET}")
-        try:
-            update_status("", str(e), [
-                {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
-                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
-            ])
-        except Exception:
-            pass
+        _update_error_status(str(e))
     except ApiException as e:
         error_msg = f"K8s API error: {e.reason} (status: {e.status})"
         LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  {error_msg}{C.RESET}")
-        try:
-            update_status("", error_msg, [
-                {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
-                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
-            ])
-        except Exception:
-            pass
+        _update_error_status(error_msg)
     except Exception as e:
         error_msg = f"Unexpected error: {e}"
         LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  {error_msg}{C.RESET}", exc_info=True)
-        try:
-            update_status("", error_msg, [
-                {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
-                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
-            ])
-        except Exception:
-            pass
+        _update_error_status(error_msg)
     finally:
         reconcile_lock.release()
 
 
-# ---------------- Kopf Configuration ----------------
+# ---------------- Kopf Event Hooks ----------------
 @kopf.on.startup()
-def configure(settings: kopf.OperatorSettings, **_):
-    """Configure kopf threading, peering, and namespace scoping."""
+def startup(settings: kopf.OperatorSettings, **_):
+    """Configure kopf settings and perform initial startup tasks."""
     settings.posting.level = logging.WARNING
     settings.watching.server_timeout = 270
     settings.watching.client_timeout = 300
     settings.execution.max_workers = 2
     settings.peering.standalone = True
-
-    LOG.info(f"Kopf configured: max_workers=2, namespace={OPERATOR_NAMESPACE}")
-
-
-# ---------------- Kopf Event Hooks ----------------
-@kopf.on.startup()
-def startup(**_):
-    """Operator startup handler."""
     LOG.info(
         f"\n"
         f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
@@ -871,8 +854,6 @@ def startup(**_):
         f"  ║  CR Name   : {CR_NAME:<43}  ║  {C.RESET}\n"
         f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
         f"  ║  Reconcile : {str(RECONCILE_INTERVAL) + 's':<43}  ║  {C.RESET}\n"
-        f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
-        f"  ║  Debounce  : {str(MIN_RECONCILE_INTERVAL) + 's':<43}  ║  {C.RESET}\n"
         f"{C.BOLD}{C.BG_CYAN}{C.WHITE}"
         f"  ╚══════════════════════════════════════════════════════════╝  {C.RESET}"
     )
@@ -933,8 +914,6 @@ def on_node_event(type, body, name, **_):
     - MODIFIED with GPU state change: Trigger immediate reconciliation.
     All other MODIFIED events are ignored to avoid API server pressure.
     """
-    global last_reconcile_time
-
     if type is None:
         return
 
@@ -945,7 +924,6 @@ def on_node_event(type, body, name, **_):
         LOG.info(f"{color}{C.BOLD}  ● NODE {type}: {name}{C.RESET} — triggering immediate reconciliation")
         reconcile()
         remove_node_finalizers()
-        last_reconcile_time = time.time()
 
     elif type == 'MODIFIED' and gpu_state_changed:
         LOG.info(
@@ -956,7 +934,6 @@ def on_node_event(type, body, name, **_):
         )
         reconcile()
         remove_node_finalizers()
-        last_reconcile_time = time.time()
     else:
         LOG.debug(f"Node event {type}: {name} — no GPU change, skipping")
 
