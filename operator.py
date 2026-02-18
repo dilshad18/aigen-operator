@@ -501,7 +501,7 @@ def update_status(target_ns, message, deployments,
         deployments: list of dicts, each with keys:
             workload, name, mode, replicas, requiredGpuMemoryGB, gpuMemoryMet
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
         cr = custom_api.get_namespaced_custom_object_status(
@@ -514,8 +514,7 @@ def update_status(target_ns, message, deployments,
             return
         existing_status = {}
 
-    # Build human-readable summary for the printer column
-    # e.g. "ai-llm(gpu/1) ai-text-proc-gpu(gpu/2)"
+    # Build summary for the printer column using full deployment names
     summary_parts = []
     for d in deployments:
         summary_parts.append(f"{d['name']}({d['mode']}/{d['replicas']})")
@@ -531,6 +530,7 @@ def update_status(target_ns, message, deployments,
             "totalGpuMemoryGB": total_gpu_memory_gb or 0,
             "gpuNodeCount": gpu_node_count or 0,
             "cpuNodeCount": cpu_node_count or 0,
+            "gpuMemoryDisplay": f"{total_gpu_memory_gb or 0:.2f} GB",
         },
         "deployments": deployments,
     }
@@ -622,31 +622,26 @@ def reconcile():
         tp_replicas = tp_cfg.get("replicas", 1)
         tp_required_gb = tp_cfg["requiredGpuMemoryGB"]
 
-        # ---- Validate all deployments exist ----
-        all_deployments = {
-            "llm (GPU)": llm_name,
-            "textProcessing (CPU)": tp_cpu_name,
-            "textProcessing (GPU)": tp_gpu_name,
-        }
+        # ---- Validate which deployments exist ----
+        llm_exists = validate_deployment_exists(llm_name, target_ns)
+        tp_cpu_exists = validate_deployment_exists(tp_cpu_name, target_ns)
+        tp_gpu_exists = validate_deployment_exists(tp_gpu_name, target_ns)
+
         missing = []
-        for label, dep_name in all_deployments.items():
-            if not validate_deployment_exists(dep_name, target_ns):
-                missing.append(f"{label}={dep_name}")
+        if not llm_exists:
+            missing.append(f"llm (GPU)={llm_name}")
+        if not tp_cpu_exists:
+            missing.append(f"textProcessing (CPU)={tp_cpu_name}")
+        if not tp_gpu_exists:
+            missing.append(f"textProcessing (GPU)={tp_gpu_name}")
 
         if missing:
-            error_msg = f"Required deployment(s) not found: {', '.join(missing)}"
-            LOG.error(error_msg)
-            update_status(target_ns, error_msg, [
-                {"workload": "llm", "name": llm_name, "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": llm_required_gb, "gpuMemoryMet": False},
-                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
-                 "requiredGpuMemoryGB": tp_required_gb, "gpuMemoryMet": False},
-            ])
-            return
+            LOG.warning(f"Missing deployment(s): {', '.join(missing)}")
 
-        # ---- Inject managed-by labels onto deployments ----
-        for dep_name in [llm_name, tp_cpu_name, tp_gpu_name]:
-            label_managed_deployment(dep_name, target_ns)
+        # ---- Inject managed-by labels onto existing deployments ----
+        for dep_name, exists in [(llm_name, llm_exists), (tp_cpu_name, tp_cpu_exists), (tp_gpu_name, tp_gpu_exists)]:
+            if exists:
+                label_managed_deployment(dep_name, target_ns)
 
         # ---- Discover GPU nodes ----
         nodes = core_v1.list_node().items
@@ -657,43 +652,73 @@ def reconcile():
         # ---- Calculate total GPU memory ----
         total_gpu_memory_gb, total_gpu_count, gpu_node_details = calculate_total_gpu_memory_gb(gpu_nodes)
 
-        # ---- Per-deployment GPU memory checks ----
-        llm_gpu_met = (gpu_node_count > 0 and total_gpu_memory_gb >= llm_required_gb)
-        tp_gpu_met = (gpu_node_count > 0 and total_gpu_memory_gb >= tp_required_gb)
-
         # ================================================================
-        # SCALING DECISIONS (per-deployment, independent)
+        # SCALING DECISIONS (priority-based: LLM gets GPU first)
         # ================================================================
 
-        # ---- LLM Decision ----
-        if llm_gpu_met:
+        # ---- LLM Decision (highest priority) ----
+        if not llm_exists:
+            llm_mode = "error"
+            llm_target_replicas = 0
+            llm_gpu_reserved = 0
+            llm_gpu_met = False
+            llm_message = f"Deployment {llm_name} not found"
+        elif gpu_node_count > 0 and total_gpu_memory_gb >= llm_required_gb:
             llm_mode = "gpu"
             llm_target_replicas = llm_replicas
+            llm_gpu_reserved = llm_required_gb
+            llm_gpu_met = True
             llm_message = f"GPU memory met ({total_gpu_memory_gb:.2f}>={llm_required_gb:.2f} GB), scaled to {llm_replicas}"
         else:
             llm_mode = "off"
             llm_target_replicas = 0
+            llm_gpu_reserved = 0
+            llm_gpu_met = False
             if gpu_node_count > 0:
                 llm_message = f"GPU memory insufficient ({total_gpu_memory_gb:.2f}<{llm_required_gb:.2f} GB), scaled to 0"
             else:
                 llm_message = f"No GPU nodes available, scaled to 0"
 
-        # ---- Text-Processing Decision ----
-        if tp_gpu_met:
+        # ---- Text-Processing Decision (uses remaining GPU after LLM) ----
+        remaining_gpu_gb = total_gpu_memory_gb - llm_gpu_reserved
+        tp_gpu_met = (gpu_node_count > 0 and remaining_gpu_gb >= tp_required_gb)
+
+        if not tp_cpu_exists and not tp_gpu_exists:
+            tp_mode = "error"
+            tp_active_name = tp_cpu_name
+            tp_inactive_name = tp_gpu_name
+            tp_target_replicas = 0
+            tp_gpu_met = False
+            tp_message = f"Deployments {tp_cpu_name} and {tp_gpu_name} not found"
+        elif tp_gpu_met and tp_gpu_exists:
             tp_mode = "gpu"
             tp_active_name = tp_gpu_name
             tp_inactive_name = tp_cpu_name
             tp_target_replicas = tp_replicas
-            tp_message = f"GPU memory met ({total_gpu_memory_gb:.2f}>={tp_required_gb:.2f} GB), using GPU variant"
-        else:
+            tp_message = (
+                f"Remaining GPU memory met ({remaining_gpu_gb:.2f}>={tp_required_gb:.2f} GB "
+                f"after LLM reserved {llm_gpu_reserved:.2f} GB), using GPU variant"
+            )
+        elif tp_cpu_exists:
             tp_mode = "cpu"
             tp_active_name = tp_cpu_name
             tp_inactive_name = tp_gpu_name
             tp_target_replicas = tp_replicas
-            if gpu_node_count > 0:
-                tp_message = f"GPU memory insufficient ({total_gpu_memory_gb:.2f}<{tp_required_gb:.2f} GB), using CPU variant"
+            if not tp_gpu_exists:
+                tp_message = f"GPU deployment {tp_gpu_name} not found, using CPU variant"
+            elif gpu_node_count > 0:
+                tp_message = (
+                    f"Remaining GPU memory insufficient ({remaining_gpu_gb:.2f}<{tp_required_gb:.2f} GB "
+                    f"after LLM reserved {llm_gpu_reserved:.2f} GB), using CPU variant"
+                )
             else:
                 tp_message = f"No GPU nodes available, using CPU variant"
+        else:
+            tp_mode = "error"
+            tp_active_name = tp_gpu_name
+            tp_inactive_name = tp_cpu_name
+            tp_target_replicas = 0
+            tp_message = f"CPU deployment {tp_cpu_name} not found and GPU threshold not met"
 
         # ---- Reconciliation plan banner (deployments + thresholds only) ----
         B = f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
@@ -708,9 +733,10 @@ def reconcile():
             f"{B}  ║  ai-text-processing  │ {tp_active_name:<25} │ {tp_target_replicas:<8} │ {tp_mode:<9} ║  {R}\n"
             f"{B}  ║  ai-text-processing  │ {tp_inactive_name:<25} │ {'0':<8} │ {'off':<9} ║  {R}\n"
             f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
-            f"{B}  ║  Thresholds: LLM={llm_required_gb:.0f}GB ({'MET' if llm_gpu_met else 'NOT MET'})"
-            f"  │  TextProcessing={tp_required_gb:.0f}GB ({'MET' if tp_gpu_met else 'NOT MET'})"
-            f"{' ' * max(0, 11 - len(f'{llm_required_gb:.0f}') - len(f'{tp_required_gb:.0f}'))}║  {R}\n"
+            f"{B}  ║  Priority : LLM={llm_required_gb:.0f}GB ({'MET' if llm_gpu_met else 'NOT MET'})"
+            f"  │  Remaining: {remaining_gpu_gb:.2f}GB"
+            f"  │  TP={tp_required_gb:.0f}GB ({'MET' if tp_gpu_met else 'NOT MET'})"
+            f"{' ' * max(0, 3 - len(f'{llm_required_gb:.0f}') - len(f'{tp_required_gb:.0f}'))}║  {R}\n"
             f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
             f"{B}  ║  CLUSTER STATUS                                                          ║  {R}\n"
             f"{B}  ║  Nodes: {len(nodes):<5} │ GPU Nodes: {gpu_node_count:<5} │ CPU Nodes: {cpu_node_count:<5} │ GPUs: {total_gpu_count:<5} │ Mem: {total_gpu_memory_gb:.2f} GB  ║  {R}\n"
@@ -724,13 +750,37 @@ def reconcile():
                     f"{detail['total_memory_gb']:.2f} GB{C.RESET}"
                 )
 
-        # ---- Execute scaling ----
-        scale_deployment(llm_name, target_ns, llm_target_replicas)
-        scale_deployment(tp_active_name, target_ns, tp_target_replicas)
-        scale_deployment(tp_inactive_name, target_ns, 0)
+        # ---- Execute scaling (per-deployment, skip missing, track failures) ----
+        scale_errors = []
+        deployments_to_scale = []
+        if llm_exists:
+            deployments_to_scale.append((llm_name, llm_target_replicas, "llm"))
+        if tp_active_name == tp_gpu_name and tp_gpu_exists:
+            deployments_to_scale.append((tp_active_name, tp_target_replicas, f"textProcessing({tp_mode})"))
+        elif tp_active_name == tp_cpu_name and tp_cpu_exists:
+            deployments_to_scale.append((tp_active_name, tp_target_replicas, f"textProcessing({tp_mode})"))
+        if tp_inactive_name == tp_gpu_name and tp_gpu_exists:
+            deployments_to_scale.append((tp_inactive_name, 0, "textProcessing(off)"))
+        elif tp_inactive_name == tp_cpu_name and tp_cpu_exists:
+            deployments_to_scale.append((tp_inactive_name, 0, "textProcessing(off)"))
+
+        for dep_name, dep_replicas, dep_label in deployments_to_scale:
+            try:
+                scale_deployment(dep_name, target_ns, dep_replicas)
+            except Exception as e:
+                err = f"{dep_label}={dep_name}: {e}"
+                scale_errors.append(err)
+                LOG.error(f"{C.RED}{C.BOLD}  ✗ Scale failed for {dep_name}: {e}{C.RESET}")
 
         # ---- Build status message ----
-        msg = f"Sync successful: llm={llm_mode}, textProcessing={tp_mode}"
+        if missing and scale_errors:
+            msg = f"Sync partial: missing={', '.join(missing)}; errors={'; '.join(scale_errors)}"
+        elif missing:
+            msg = f"Sync partial: missing={', '.join(missing)}"
+        elif scale_errors:
+            msg = f"Sync partial: {'; '.join(scale_errors)}"
+        else:
+            msg = "Sync successful"
 
         update_status(
             target_ns, msg,
@@ -748,7 +798,10 @@ def reconcile():
             cpu_node_count=cpu_node_count,
         )
 
-        LOG.info(f"{C.GREEN}{C.BOLD}  ✓ Reconciliation completed successfully{C.RESET}")
+        if scale_errors:
+            LOG.warning(f"{C.YELLOW}{C.BOLD}  ⚠ Reconciliation completed with errors{C.RESET}")
+        else:
+            LOG.info(f"{C.GREEN}{C.BOLD}  ✓ Reconciliation completed successfully{C.RESET}")
 
     except ValueError as e:
         LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  Validation error: {e}{C.RESET}")
@@ -762,9 +815,29 @@ def reconcile():
         except Exception:
             pass
     except ApiException as e:
-        LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  K8s API: {e.reason} (status: {e.status}){C.RESET}")
+        error_msg = f"K8s API error: {e.reason} (status: {e.status})"
+        LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  {error_msg}{C.RESET}")
+        try:
+            update_status("", error_msg, [
+                {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+            ])
+        except Exception:
+            pass
     except Exception as e:
-        LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  Unexpected: {e}{C.RESET}", exc_info=True)
+        error_msg = f"Unexpected error: {e}"
+        LOG.error(f"{C.RED}{C.BOLD}  ✗ RECONCILE FAILED  │  {error_msg}{C.RESET}", exc_info=True)
+        try:
+            update_status("", error_msg, [
+                {"workload": "llm", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+                {"workload": "textProcessing", "name": "", "mode": "error", "replicas": 0,
+                 "requiredGpuMemoryGB": 0, "gpuMemoryMet": False},
+            ])
+        except Exception:
+            pass
     finally:
         reconcile_lock.release()
 
@@ -893,10 +966,14 @@ _expected_replicas = {}
 _expected_replicas_lock = threading.Lock()
 
 
-@kopf.on.event('apps', 'v1', 'deployments', labels={MANAGED_BY_LABEL: MANAGED_BY_VALUE})
+@kopf.on.event('apps', 'v1', 'deployments')
 def on_deployment_event(name, namespace, body, type, **_):
     """Detect manual scaling drift on managed deployments and correct immediately."""
     if type is None:
+        return
+
+    labels = body.get("metadata", {}).get("labels", {})
+    if labels.get(MANAGED_BY_LABEL) != MANAGED_BY_VALUE:
         return
 
     current_replicas = body.get("spec", {}).get("replicas")

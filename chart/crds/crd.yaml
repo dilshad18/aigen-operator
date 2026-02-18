@@ -3,9 +3,11 @@ kind: CustomResourceDefinition
 metadata:
   name: aigens.infra.whiz.ai
   annotations:
+    # Helm hooks (for helm install/upgrade)
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-5"
     "helm.sh/hook-delete-policy": before-hook-creation
+    # ArgoCD hooks (for ArgoCD sync)
     "argocd.argoproj.io/hook": PreSync
     "argocd.argoproj.io/hook-weight": "-5"
     "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation
@@ -23,24 +25,24 @@ spec:
       served: true
       storage: true
       additionalPrinterColumns:
-        - name: Active Deployment
-          type: string
-          jsonPath: .status.activeDeployment
         - name: Namespace
           type: string
-          jsonPath: .status.activeNamespace
-        - name: Replicas
+          jsonPath: .status.namespace
+        - name: Deployments
+          type: string
+          jsonPath: .status.deploymentSummary
+        - name: GPU Mem
+          type: string
+          jsonPath: .status.cluster.gpuMemoryDisplay
+        - name: GPU Nodes
           type: integer
-          jsonPath: .status.activeReplicas
+          jsonPath: .status.cluster.gpuNodeCount
+        - name: CPU Nodes
+          type: integer
+          jsonPath: .status.cluster.cpuNodeCount
         - name: Last Sync
           type: string
           jsonPath: .status.lastSyncTime
-        - name: GPU Count
-          type: integer
-          jsonPath: .status.totalGpuCount
-        - name: GPU Memory (GB)
-          type: number
-          jsonPath: .status.totalGpuMemoryGB
         - name: Message
           type: string
           jsonPath: .status.message
@@ -55,35 +57,107 @@ spec:
           properties:
             spec:
               type: object
+              required:
+                - targetNamespace
+                - llmDeployment
+                - textProcessingDeployment
               properties:
                 targetNamespace:
                   type: string
-                cpuDeployment:
-                  type: string
-                gpuDeployment:
-                  type: string
-                replicas:
-                  type: integer
-                  default: 1
-                requiredGpuMemoryGB:
-                  type: number
-                  description: "Required GPU memory in GB. The operator sums nvidia.com/gpu.memory labels (MB) across GPU nodes, converts to GB, and schedules the GPU deployment only if total >= this value."
+                  description: "Namespace where the managed deployments live."
+                llmDeployment:
+                  type: object
+                  description: "LLM deployment config. Runs ONLY on GPU nodes when its GPU memory requirement is met; scaled to 0 otherwise."
+                  required:
+                    - name
+                    - requiredGpuMemoryGB
+                  properties:
+                    name:
+                      type: string
+                      description: "Name of the LLM GPU deployment."
+                    replicas:
+                      type: integer
+                      default: 1
+                      description: "Desired replicas when GPU memory requirement is met."
+                    requiredGpuMemoryGB:
+                      type: number
+                      description: "Minimum total GPU memory (GB) required to run this deployment. If total < this value, the deployment is scaled to 0."
+                textProcessingDeployment:
+                  type: object
+                  description: "Text-processing deployment config. Switches between CPU and GPU variants based on its own GPU memory threshold."
+                  required:
+                    - cpuDeployment
+                    - gpuDeployment
+                    - requiredGpuMemoryGB
+                  properties:
+                    cpuDeployment:
+                      type: string
+                      description: "Name of the CPU variant deployment (fallback when GPU memory is insufficient)."
+                    gpuDeployment:
+                      type: string
+                      description: "Name of the GPU variant deployment (active when GPU memory requirement is met)."
+                    replicas:
+                      type: integer
+                      default: 1
+                      description: "Desired replicas for the active variant."
+                    requiredGpuMemoryGB:
+                      type: number
+                      description: "Minimum total GPU memory (GB) required to use the GPU variant. If total < this value, the CPU variant is used instead."
             status:
               type: object
               properties:
                 lastSyncTime:
                   type: string
-                activeDeployment:
-                  type: string
-                activeNamespace:
+                namespace:
                   type: string
                 message:
                   type: string
-                activeReplicas:
-                  type: integer
-                totalGpuCount:
-                  type: integer
-                  description: "Total number of GPUs available across all schedulable GPU nodes."
-                totalGpuMemoryGB:
-                  type: number
-                  description: "Total GPU memory available across all schedulable GPU nodes, in GB."
+                deploymentSummary:
+                  type: string
+                  description: "Human-readable one-line summary of all deployment states for kubectl column output."
+                cluster:
+                  type: object
+                  description: "Cluster-wide node and GPU information."
+                  properties:
+                    totalGpuCount:
+                      type: integer
+                      description: "Total number of GPUs across all schedulable GPU nodes."
+                    totalGpuMemoryGB:
+                      type: number
+                      description: "Total GPU memory available across all schedulable GPU nodes, in GB."
+                    gpuNodeCount:
+                      type: integer
+                      description: "Number of schedulable GPU nodes."
+                    cpuNodeCount:
+                      type: integer
+                      description: "Number of schedulable CPU-only nodes (no GPU)."
+                    gpuMemoryDisplay:
+                      type: string
+                      description: "Human-readable GPU memory string for kubectl column output (e.g. '48.00 GB')."
+                deployments:
+                  type: array
+                  description: "Status of each managed deployment."
+                  items:
+                    type: object
+                    properties:
+                      workload:
+                        type: string
+                        description: "Workload identifier: 'llm' or 'textProcessing'."
+                      name:
+                        type: string
+                        description: "Active deployment name."
+                      mode:
+                        type: string
+                        description: "Current mode: 'gpu', 'cpu', or 'off'."
+                      replicas:
+                        type: integer
+                        description: "Current replica count."
+                      requiredGpuMemoryGB:
+                        type: number
+                        description: "GPU memory threshold for this workload."
+                      gpuMemoryMet:
+                        type: boolean
+                        description: "Whether total GPU memory meets this workload's threshold."
+                      message:
+                        type: string
+                        description: "Reconciliation result for this deployment."
