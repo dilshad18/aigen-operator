@@ -78,9 +78,11 @@ spec:
                     replicas:
                       type: integer
                       default: 1
+                      minimum: 0
                       description: "Desired replicas when GPU memory requirement is met."
                     requiredGpuMemoryGB:
                       type: number
+                      minimum: 0
                       description: "Minimum total GPU memory (GB) required to run this deployment. If total < this value, the deployment is scaled to 0."
                 textProcessingDeployment:
                   type: object
@@ -99,15 +101,18 @@ spec:
                     replicas:
                       type: integer
                       default: 1
+                      minimum: 0
                       description: "Desired replicas for the active variant."
                     requiredGpuMemoryGB:
                       type: number
+                      minimum: 0
                       description: "Minimum total GPU memory (GB) required to use the GPU variant. If total < this value, the CPU variant is used instead."
             status:
               type: object
               properties:
                 lastSyncTime:
                   type: string
+                  format: date-time
                 namespace:
                   type: string
                 message:
