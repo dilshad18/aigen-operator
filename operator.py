@@ -738,6 +738,8 @@ def reconcile():
         # ---- Reconciliation plan banner (deployments + thresholds only) ----
         B = f"{C.BOLD}{C.BG_MAGENTA}{C.WHITE}"
         R = C.RESET
+        llm_threshold_label = "MISSING" if not llm_exists else "MET" if llm_gpu_met else "NOT MET"
+        tp_threshold_label = "MISSING" if (not tp_cpu_exists and not tp_gpu_exists) else "MET" if tp_gpu_met else "NOT MET"
         LOG.info(
             f"\n"
             f"{B}  ╔══════════════════════════════════════════════════════════════════════════╗  {R}\n"
@@ -748,9 +750,9 @@ def reconcile():
             f"{B}  ║  ai-text-processing  │ {tp_active_name:<25} │ {tp_target_replicas:<8} │ {tp_mode:<9} ║  {R}\n"
             f"{B}  ║  ai-text-processing  │ {tp_inactive_name:<25} │ {'0':<8} │ {'off':<9} ║  {R}\n"
             f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
-            f"{B}  ║  Priority : LLM={llm_required_gb:.0f}GB ({'MET' if llm_gpu_met else 'NOT MET'})"
+            f"{B}  ║  Priority : LLM={llm_required_gb:.0f}GB ({llm_threshold_label})"
             f"  │  Remaining: {remaining_gpu_gb:.2f}GB"
-            f"  │  TP={tp_required_gb:.0f}GB ({'MET' if tp_gpu_met else 'NOT MET'})"
+            f"  │  TP={tp_required_gb:.0f}GB ({tp_threshold_label})"
             f"{' ' * max(0, 3 - len(f'{llm_required_gb:.0f}') - len(f'{tp_required_gb:.0f}'))}║  {R}\n"
             f"{B}  ╠══════════════════════════════════════════════════════════════════════════╣  {R}\n"
             f"{B}  ║  CLUSTER STATUS                                                          ║  {R}\n"
